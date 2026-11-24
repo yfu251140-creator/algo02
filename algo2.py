@@ -1,8 +1,6 @@
 """One ALGO2 simulation round using the local RIT REST API."""
 
 import json
-import os
-from getpass import getpass
 from time import sleep
 
 from urllib.error import HTTPError, URLError
@@ -10,6 +8,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 URL = "http://localhost:9999/v1"
+API_KEY = "YOUR API KEY HERE"  # Set this in your local copy.
 TICKER = "ALGO"
 MIN_TRADED = 15_000
 MAX_ORDER = 5_000
@@ -195,9 +194,11 @@ def run(session):
 
 
 def main():
-    key = os.environ.get("RIT_API_KEY") or getpass("RIT API key: ")
+    if not API_KEY.strip() or API_KEY == "YOUR API KEY HERE":
+        print("Set API_KEY at the top of algo2.py before running.")
+        return 1
     try:
-        return 0 if run(key) else 1
+        return 0 if run(API_KEY.strip()) else 1
     except (OSError, RuntimeError, KeyboardInterrupt) as exc:
         print(f"Stopped: {exc}")
         return 1
