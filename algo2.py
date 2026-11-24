@@ -15,7 +15,8 @@ MAX_ORDER = 5_000
 MAX_POSITION = 25_000
 CASE_SECONDS = 300
 FLATTEN_SECONDS = 15
-ORDERS_PER_SECOND = 1  # Set this to the measured limit for each round.
+MAX_ORDERS_PER_SECOND = 10
+PROBE_SECONDS = 2
 POLL_SECONDS = 0.25
 STALE_CENTS = 2
 STATUS_INTERVAL = 10
@@ -104,6 +105,38 @@ def security(session):
     return api(session, "GET", "/securities", ticker=TICKER)[0]
 
 
+class OrderPace:
+    def __init__(self):
+        self.rate = 1
+        self.locked = False
+        self.next_at = 0.0
+        self.last_sent = None
+        self.busy_since = None
+
+    def accepted(self, sent_at, probing):
+        interval = 1 / self.rate
+        if (
+            self.last_sent is None
+            or sent_at - self.last_sent > interval * 1.25
+        ):
+            self.busy_since = sent_at
+        self.last_sent = sent_at
+        if (
+            probing and not self.locked and self.rate < MAX_ORDERS_PER_SECOND
+            and sent_at - self.busy_since >= PROBE_SECONDS
+        ):
+            self.rate += 1
+            self.busy_since = sent_at
+            print(f"Testing {self.rate} orders/sec.", flush=True)
+        self.next_at = sent_at + 1 / self.rate
+
+    def limited(self, sent_at, retry_after):
+        self.rate = max(1, self.rate - 1)
+        self.locked = True
+        self.next_at = max(sent_at + 1 / self.rate, monotonic() + retry_after)
+        print(f"Order rate limited. Locked at {self.rate} orders/sec.", flush=True)
+
+
 def run(session):
     tracked = set()
     closed_volume = traded = position = 0
@@ -112,12 +145,11 @@ def run(session):
     expected_count = 2
     started = False
     flattening = False
-    next_order_at = 0.0
+    pace = OrderPace()
     pending_ask = False
 
     def place(action, size, price=None):
-        nonlocal next_order_at
-        if monotonic() < next_order_at:
+        if monotonic() < pace.next_at:
             return
         case = api(session, "GET", "/case")
         if case["status"] != "ACTIVE" or case["tick"] >= CASE_SECONDS:
@@ -131,15 +163,15 @@ def run(session):
             ):
                 return
         sent_at = monotonic()
-        next_order_at = sent_at + 1 / ORDERS_PER_SECOND
         try:
             submit(session, tracked, action, size, price)
         except HTTPError as exc:
             if exc.code != 429:
                 raise
             retry_after = float(exc.headers.get("Retry-After", 1))
-            next_order_at = max(next_order_at, monotonic() + retry_after)
-            print(f"Tick {case['tick']} | Order rate limited; will refresh before trying again.")
+            pace.limited(sent_at, retry_after)
+        else:
+            pace.accepted(sent_at, probing=price is not None)
 
     try:
         while True:
@@ -164,7 +196,7 @@ def run(session):
             if case["tick"] - last_status_tick >= STATUS_INTERVAL:
                 print(
                     f"Tick {case['tick']} | Working: {len(orders)}/{expected_count} "
-                    f"| Gross: {traded:,} | Position: {position:+,}",
+                    f"| Gross: {traded:,} | Position: {position:+,} | Pace: {pace.rate}/s",
                     flush=True,
                 )
                 last_status_tick = case["tick"]
@@ -205,7 +237,7 @@ def run(session):
             else:
                 pending_ask = False
                 top = book_top(session)
-                if top and monotonic() >= next_order_at:
+                if top and monotonic() >= pace.next_at:
                     bid, ask, buy_size, sell_size = quote(top, position)
                     expected_count = 2 if buy_size and sell_size else 1
                     if buy_size:
@@ -214,7 +246,8 @@ def run(session):
                             pending_ask = True
                     elif sell_size:
                         place("SELL", sell_size, ask)
-            sleep(POLL_SECONDS)
+            until_slot = pace.next_at - monotonic()
+            sleep(min(POLL_SECONDS, until_slot) if until_slot > 0 else POLL_SECONDS)
     finally:
         if tracked:
             try:
@@ -236,9 +269,6 @@ def run(session):
 
 
 def main():
-    if not 1 <= ORDERS_PER_SECOND <= 10:
-        print("Set ORDERS_PER_SECOND to a value from 1 to 10.")
-        return 1
     if not API_KEY.strip() or API_KEY == "YOUR API KEY HERE":
         print("Set API_KEY at the top of algo2.py before running.")
         return 1
