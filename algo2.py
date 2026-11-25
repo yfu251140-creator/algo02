@@ -16,7 +16,9 @@ MIN_SPREAD_CENTS = 5
 CASE_TICKS = 300
 FLATTEN_TICK = CASE_TICKS - 15
 POLL_SECONDS = 0.5
-ORDER_INTERVAL = 1.0
+MAX_ORDERS_PER_SECOND = 10
+PROBE_SECONDS = 2.0
+POLL_RETRY_SECONDS = 1.0
 
 
 class RateLimited(Exception):
@@ -34,10 +36,10 @@ def api(method, path, **params):
     except HTTPError as exc:
         if exc.code == 429:
             try:
-                delay = float(exc.headers.get("Retry-After", "1"))
+                delay = float(exc.headers.get("Retry-After", str(POLL_RETRY_SECONDS)))
             except ValueError:
-                delay = 1
-            raise RateLimited(max(ORDER_INTERVAL, delay)) from exc
+                delay = POLL_RETRY_SECONDS
+            raise RateLimited(max(0.0, delay)) from exc
         body = exc.read(500).decode("utf-8", errors="replace")
         raise RuntimeError(f"{method} {path}{query}: HTTP {exc.code} {body}") from exc
     except URLError as exc:
@@ -77,22 +79,62 @@ def cancel(orders):
     api("POST", "/commands/cancel", ids=ids)
 
 
-def submit(fills, action, quantity, price_cents=None):
+class OrderPace:
+    def __init__(self):
+        self.rate = 1
+        self.locked = False
+        self.next_at = 0.0
+        self.last_quote_at = None
+        self.probe_started_at = None
+        self.validated_rate = 0
+
+    def accepted(self, sent_at, probing):
+        interval = 1 / self.rate
+        if probing and not self.locked:
+            if self.last_quote_at is None or sent_at - self.last_quote_at > interval * 1.25:
+                self.probe_started_at = sent_at
+            self.last_quote_at = sent_at
+            if sent_at - self.probe_started_at >= PROBE_SECONDS:
+                self.validated_rate = self.rate
+                if self.rate == MAX_ORDERS_PER_SECOND:
+                    self.locked = True
+                    print("Held 10 orders/sec without order HTTP 429.", flush=True)
+                else:
+                    self.rate += 1
+                    self.probe_started_at = None
+                    self.last_quote_at = None
+                    print(f"Testing {self.rate} orders/sec.", flush=True)
+        self.next_at = sent_at + 1 / self.rate
+
+    def limited(self, sent_at, retry_after):
+        self.rate = max(1, self.rate - 1)
+        self.locked = True
+        self.next_at = max(sent_at + 1 / self.rate, monotonic() + retry_after)
+        print(f"Order HTTP 429. Pace locked at {self.rate} orders/sec.", flush=True)
+
+
+def submit(fills, pace, action, quantity, price_cents=None):
     params = dict(ticker=TICKER, action=action, quantity=quantity, type="MARKET")
     if price_cents is not None:
         params.update(type="LIMIT", price=f"{price_cents / 100:.2f}")
-    order = api("POST", "/orders", **params)
+    sent_at = monotonic()
+    try:
+        order = api("POST", "/orders", **params)
+    except RateLimited as exc:
+        pace.limited(sent_at, exc.args[0])
+        return
     fills[order["order_id"]] = int(order["quantity_filled"])
+    pace.accepted(sent_at, probing=price_cents is not None)
 
 
 def cents(price):
     return round(float(price) * 100)
 
 
-def quote(fills, working, inventory):
+def quote(fills, pace, working, inventory):
     book = api("GET", "/securities/book", ticker=TICKER)
     if not book["bids"] or not book["asks"]:
-        return False
+        return
 
     bid = cents(book["bids"][0]["price"])
     ask = cents(book["asks"][0]["price"])
@@ -103,10 +145,10 @@ def quote(fills, working, inventory):
     ]
     if stale:
         cancel(stale)
-        return False
+        return
 
     if ask - bid < MIN_SPREAD_CENTS:
-        return False
+        return
 
     sides = [
         ("BUY", bid, MAX_POSITION - inventory),
@@ -117,9 +159,8 @@ def quote(fills, working, inventory):
     working_sides = {order["action"] for order in working}
     for action, price, capacity in sides:
         if action not in working_sides and capacity > 0:
-            submit(fills, action, min(MAX_ORDER, capacity), price)
-            return True
-    return False
+            submit(fills, pace, action, min(MAX_ORDER, capacity), price)
+            return
 
 
 def run():
@@ -130,7 +171,8 @@ def run():
 
     fills = {}
     last_report = None
-    next_order_at = 0.0
+    pace = OrderPace()
+    print("Testing 1 order/sec.", flush=True)
     try:
         while True:
             try:
@@ -145,7 +187,7 @@ def run():
                 if report != last_report:
                     print(
                         f"Tick {case['tick']} | Gross: {report[0]:,}/{TARGET_VOLUME:,} "
-                        f"| Position: {inventory:+,}", flush=True
+                        f"| Position: {inventory:+,} | Pace: {pace.rate}/s", flush=True
                     )
                     last_report = report
 
@@ -156,19 +198,24 @@ def run():
                     elif not working and not pending:
                         if not inventory:
                             break
-                        if monotonic() >= next_order_at:
+                        if monotonic() >= pace.next_at:
                             action = "SELL" if inventory > 0 else "BUY"
-                            submit(fills, action, min(MAX_ORDER, abs(inventory)))
-                            next_order_at = monotonic() + ORDER_INTERVAL
-                elif not pending and monotonic() >= next_order_at:
-                    if quote(fills, working, inventory):
-                        next_order_at = monotonic() + ORDER_INTERVAL
+                            submit(fills, pace, action, min(MAX_ORDER, abs(inventory)))
+                elif not pending and monotonic() >= pace.next_at:
+                    quote(fills, pace, working, inventory)
             except RateLimited as exc:
-                print(f"RIT rate limit. Waiting {exc.args[0]:g} seconds.", flush=True)
-                sleep(exc.args[0])
+                delay = max(POLL_RETRY_SECONDS, exc.args[0])
+                print(f"RIT request limited. Waiting {delay:g} seconds.", flush=True)
+                sleep(delay)
                 continue
-            sleep(POLL_SECONDS)
+
+            until_slot = pace.next_at - monotonic()
+            sleep(min(POLL_SECONDS, until_slot) if until_slot > 0 else POLL_SECONDS)
     finally:
+        print(
+            f"Final order pace: {pace.rate}/s | "
+            f"Highest sustained probe without order HTTP 429: {pace.validated_rate or 'none'}"
+        )
         try:
             working = open_orders()
             our_orders = [order for order in working if order["order_id"] in fills]
